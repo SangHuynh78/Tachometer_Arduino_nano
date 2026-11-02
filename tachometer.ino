@@ -1,159 +1,257 @@
 // =====================================================================
-//  BƯỚC 2: Xác định thời điểm vật đi qua tâm từng cảm biến
-//  (chỉ xét vật cách cảm biến < DETECT_CM = 100 cm, xa hơn coi như -1)
+//  MÁY ĐO TỐC ĐỘ MINI
+//  Arduino Nano + 2 cảm biến HC-SR04 + LCD1602 I2C + đèn giao thông
 //
-//  - Đo luân phiên A, B; mỗi mẫu gắn thời điểm millis().
-//  - Khi vật đi qua hết 1 cảm biến, in ra Serial (115200):
-//      chuỗi khoảng cách (-1 = không có vật) + thời điểm từng mẫu
-//      t_min  : lúc khoảng cách nhỏ nhất
-//      t_giua : giữa lần đầu và lần cuối thấy vật
-//  - Nếu cả A và B cùng có kết quả gần nhau, in chênh lệch thời gian
-//    (bước sau: vận tốc = khoảng cách 2 cảm biến / chênh lệch này).
-//  - LCD: khoảng cách hiện tại + thời điểm qua tâm gần nhất (giây).
+//  Cách hoạt động:
+//    0. Khởi động: ĐO NỀN 2 giây (để trống trước cảm biến) để biết vật đứng yên
+//       gần nhất (tường, bàn...). Sau đó chỉ tính vật gần hơn nền 8 cm trở lên.
+//    1. Hai cảm biến A, B đặt cách nhau 19.5 cm, đo luân phiên.
+//    2. Khi vật đi ngang qua 1 cảm biến, ghi lại lúc vật GẦN NHẤT (t_min, d_min).
+//    3. Khi vật đã qua cả A và B:
+//       - d_min của A và B lệch nhau > 2 cm  -> "LECH", đèn ĐỎ
+//       - ngược lại tính vận tốc = 19.5 cm / (t_min B - t_min A)
+//           <= 6 km/h -> đèn XANH,  > 6 km/h -> đèn VÀNG
+//    4. Vật chỉ qua 1 cảm biến -> lỗi, tắt đèn.
 //
-//  Nối dây: A: TRIG D2, ECHO D3 | B: TRIG D4, ECHO D5 | LCD I2C: A4, A5
+//  Nối dây:
+//    Cảm biến A : TRIG -> D2, ECHO -> D3
+//    Cảm biến B : TRIG -> D4, ECHO -> D5
+//    LCD I2C    : SDA  -> A4, SCL  -> A5
+//    Đèn        : Đỏ -> A0, Vàng -> A1, Xanh -> A2
 // =====================================================================
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include "hc-sr04.h"
-#include "pass-detect.h"
 
-// ---- Cấu hình ----
-#define PIN_TRIG_A     2
-#define PIN_ECHO_A     3
-#define PIN_TRIG_B     4
-#define PIN_ECHO_B     5
-#define MAX_CM         110    // chỉ chờ vọng trong 110 cm (~6,4 ms)
-#define DETECT_CM      100    // chỉ tính vật gần hơn 100 cm; xa hơn -> bỏ qua (ghi -1)
-#define END_MISSES     4      // số mẫu trống liên tiếp -> vật đã đi qua
-#define PING_GAP_MS    12     // khoảng cách giữa 2 lần phát (A,B luân phiên -> mỗi cảm biến 24 ms/mẫu)
-                              // số nhảy lung tung khi không có vật -> tăng lên 15
-#define PAIR_WINDOW_MS 5000   // A và B cách nhau quá mức này thì không ghép cặp
-#define LCD_ADDR       0      // 0 = tự dò
+// ---------------- Các con số cố định ----------------
+const float KHOANG_CACH_AB  = 19.5;   // khoảng cách giữa 2 cảm biến (cm)
+const float GIOI_HAN_TOC_DO = 6.0;    // km/h
+const float LECH_TOI_DA     = 2.0;    // cm
+const float XA_NHAT         = 100.0;  // chỉ tính vật gần hơn 100 cm
+const float CACH_NEN        = 8.0;    // vật phải gần hơn nền ít nhất 8 cm
+const int   NGHI_GIUA_2_LAN = 15;     // ms nghỉ giữa 2 lần đo (tránh A nghe nhầm sóng của B)
+const int   SO_LAN_TRONG    = 3;      // không thấy vật 3 lần liên tiếp -> vật đã đi qua
+const int   SO_MAU_LOG      = 40;     // số mẫu tối đa ghi lại mỗi lần vật đi qua
 
-HCSR04       sensor[2];
-PassDetector det[2];
-LiquidCrystal_I2C *lcd = nullptr;
+const int LED_DO   = A0;
+const int LED_VANG = A1;
+const int LED_XANH = A2;
 
-float    lastCm[2]     = { HCSR04_NO_ECHO, HCSR04_NO_ECHO };
-bool     printPending[2] = { false, false };
-bool     unpaired[2]     = { false, false };
-uint32_t lastPassMs[2]   = { 0, 0 };
+LiquidCrystal_I2C lcd(0x27, 16, 2);   // màn hình không hiện chữ -> đổi 0x27 thành 0x3F
+
+// ---------------- Dữ liệu của 1 cảm biến ----------------
+struct CamBien {
+  char   ten;                 // 'A' hoặc 'B'
+  HCSR04 hc;                  // chân TRIG, ECHO
+  float  nguong;              // chỉ tính vật gần hơn ngưỡng này (cm), có sau khi đo nền
+  bool   dangThayVat;         // đang có vật trước cảm biến
+  int    soLanThay;           // số lần thấy vật trong lần đi qua này
+  int    soLanTrongLienTiep;  // số lần liên tiếp không thấy vật
+  float  dMin;                // khoảng cách nhỏ nhất (cm)
+  unsigned long tMin;         // thời điểm khoảng cách nhỏ nhất (ms)
+  bool   coKetQua;            // vật đã đi qua xong, chờ xử lý
+  unsigned long tKetThuc;     // thời điểm vật đi qua xong
+  // Ghi lại các lần đo để in ra Serial
+  int    n;
+  float  logD[SO_MAU_LOG];
+  unsigned long logT[SO_MAU_LOG];
+};
+
+CamBien camA, camB;
 
 // ---------------------------------------------------------------------
-uint8_t findLcdAddress() {
-  Wire.begin();
-  for (uint8_t a = 0x20; a <= 0x3F; a++) {
-    if (LCD_ADDR != 0 && a != LCD_ADDR) continue;
-    Wire.beginTransmission(a);
-    if (Wire.endTransmission() == 0) return a;
+// Đưa 1 lần đo (thời điểm t, khoảng cách d) vào cảm biến
+// ---------------------------------------------------------------------
+void capNhat(CamBien &cb, unsigned long t, float d) {
+  bool thayVat = (d > 0 && d < cb.nguong);
+
+  // Vật bắt đầu xuất hiện -> làm mới dữ liệu
+  if (thayVat && !cb.dangThayVat) {
+    cb.dangThayVat = true;
+    cb.coKetQua    = false;      // bỏ kết quả cũ chưa xử lý (nếu có)
+    cb.soLanThay   = 0;
+    cb.dMin        = 999;
+    cb.n           = 0;
   }
-  return 0;
+
+  if (!cb.dangThayVat) return;   // không có vật -> không làm gì
+
+  // Ghi log (-1 = lần đó không thấy vật)
+  if (cb.n < SO_MAU_LOG) {
+    cb.logD[cb.n] = thayVat ? d : -1;
+    cb.logT[cb.n] = t;
+    cb.n++;
+  }
+
+  if (thayVat) {
+    cb.soLanThay++;
+    cb.soLanTrongLienTiep = 0;
+    if (d < cb.dMin) {           // gần hơn -> lưu lại
+      cb.dMin = d;
+      cb.tMin = t;
+    }
+  } else {
+    cb.soLanTrongLienTiep++;
+    if (cb.soLanTrongLienTiep >= SO_LAN_TRONG) {   // vật đã đi qua
+      cb.dangThayVat = false;
+      if (cb.soLanThay >= 2) {                     // chỉ thấy 1 lần -> nhiễu, bỏ
+        cb.coKetQua = true;
+        cb.tKetThuc = t;
+      }
+    }
+  }
 }
 
-// In số căn phải trong ô rộng 'w' ký tự
-void printCell(const char *s, uint8_t w) {
-  for (uint8_t k = strlen(s); k < w; k++) Serial.print(' ');
-  Serial.print(s);
-}
-
-// In kết quả một lần đi qua: chỉ thời điểm qua tâm (t_min)
-void printPass(PassDetector *p) {
-  Serial.print(F("THOI DIEM QUA TAM ")); Serial.print(p->name);
-  Serial.print(F(": t_min = ")); Serial.print(p->res.tMin);
-  Serial.println(F(" ms"));
-}
-
-// Nếu A và B đều có kết quả chưa ghép, in chênh lệch thời gian
-void tryPair() {
-  if (!unpaired[0] || !unpaired[1]) return;
-  PdResult &a = det[0].res, &b = det[1].res;
-  long dMin = (long)b.tMin - (long)a.tMin;
-  long dMid = (long)b.tMid - (long)a.tMid;
-  unpaired[0] = unpaired[1] = false;
-  if (labs(dMid) > PAIR_WINDOW_MS) return;
-
+// ---------------------------------------------------------------------
+// In chuỗi khoảng cách + thời điểm của 1 cảm biến
+// ---------------------------------------------------------------------
+void inLog(CamBien &cb) {
+  Serial.print("["); Serial.print(cb.ten); Serial.println("]");
+  Serial.print("  d(cm): ");
+  for (int i = 0; i < cb.n; i++) { Serial.print(cb.logD[i], 1); Serial.print("\t"); }
   Serial.println();
-  Serial.print(F("=== CAP A-B: huong ")); Serial.println(dMid >= 0 ? F("A -> B") : F("B -> A"));
-  Serial.print(F("    chenh lech theo t_min  = ")); Serial.print(labs(dMin)); Serial.println(F(" ms"));
-  Serial.print(F("    chenh lech theo t_giua = ")); Serial.print(labs(dMid)); Serial.println(F(" ms"));
+  Serial.print("  t(ms): ");
+  for (int i = 0; i < cb.n; i++) { Serial.print(cb.logT[i]); Serial.print("\t"); }
+  Serial.println();
+  Serial.print("  t_min = "); Serial.print(cb.tMin);
+  Serial.print(" ms, d_min = "); Serial.print(cb.dMin, 1); Serial.println(" cm");
 }
 
-// LCD: "A:123.4 @ 12.35s"
-// Mỗi lần gọi chỉ ghi 1 dòng (~20 ms) để không làm trễ nhịp đo quá lâu
-void updateLcd() {
-  static uint8_t i = 0;
-  if (!lcd) return;
-  {
-    char line[17], d[8], t[8];
-    if (lastCm[i] < 0) strcpy(d, "  ---");
-    else               dtostrf(lastCm[i], 5, 1, d);
-    dtostrf(lastPassMs[i] / 1000.0, 6, 2, t);
-    snprintf(line, sizeof(line), "%c:%s @%ss", det[i].name, d, t);
-    lcd->setCursor(0, i);
-    lcd->print(line);
+void batDen(bool doSang, bool vangSang, bool xanhSang) {
+  digitalWrite(LED_DO,   doSang);
+  digitalWrite(LED_VANG, vangSang);
+  digitalWrite(LED_XANH, xanhSang);
+}
+
+// ---------------------------------------------------------------------
+// Vật đã qua cả A và B -> so sánh, tính vận tốc, báo đèn và LCD
+// ---------------------------------------------------------------------
+void tinhKetQua() {
+  Serial.println();
+  Serial.println("===== VAT DI QUA =====");
+  inLog(camA);
+  inLog(camB);
+
+  float lech = abs(camA.dMin - camB.dMin);
+  Serial.print("Chenh lech d_min = "); Serial.print(lech, 1); Serial.println(" cm");
+
+  if (lech > LECH_TOI_DA) {
+    Serial.println(">>> LECH -> khong tinh van toc");
+    batDen(true, false, false);                        // ĐỎ
+    lcd.clear();
+    lcd.print("DO LECH!");
+    lcd.setCursor(0, 1);
+    lcd.print("A:"); lcd.print(camA.dMin, 1);
+    lcd.print(" B:"); lcd.print(camB.dMin, 1);
+    return;
   }
-  i ^= 1;
+
+  long deltaT = abs((long)camB.tMin - (long)camA.tMin);  // ms
+  Serial.print("delta_t = "); Serial.print(deltaT); Serial.println(" ms");
+  if (deltaT == 0) {
+    Serial.println(">>> delta_t = 0 -> khong tinh duoc van toc");
+    batDen(false, false, false);
+    return;
+  }
+
+  float vanTocCm = KHOANG_CACH_AB / (deltaT / 1000.0);   // cm/s
+  float vanTocKm = vanTocCm * 0.036;                       // km/h
+  Serial.print(">>> VAN TOC = "); Serial.print(vanTocCm, 1);
+  Serial.print(" cm/s = ");       Serial.print(vanTocKm, 2); Serial.println(" km/h");
+
+  bool quaToc = vanTocKm > GIOI_HAN_TOC_DO;
+  if (quaToc) Serial.println(">>> QUA TOC DO");
+  batDen(false, quaToc, !quaToc);                        // VÀNG hoặc XANH
+
+  lcd.clear();
+  lcd.print("V="); lcd.print(vanTocKm, 2); lcd.print(" km/h");
+  lcd.setCursor(0, 1);
+  if (quaToc) lcd.print("QUA TOC DO!");
+  else      { lcd.print("dt="); lcd.print(deltaT); lcd.print(" ms"); }
+}
+
+// ---------------------------------------------------------------------
+// Đo nền: đo mỗi cảm biến trong 2 giây, lấy khoảng cách nhỏ nhất (vật đứng yên).
+// Ngưỡng = nền - 8 cm (không quá 100 cm).
+// ---------------------------------------------------------------------
+void doNen(CamBien &cb) {
+  float nen = 999;
+  unsigned long batDau = millis();
+  while (millis() - batDau < 2000) {
+    float d = hcsr04_read_cm(&cb.hc);
+    if (d > 0 && d < nen) nen = d;
+    delay(30);
+  }
+  cb.nguong = min(XA_NHAT, nen - CACH_NEN);
+
+  Serial.print("Nen "); Serial.print(cb.ten); Serial.print(": ");
+  if (nen < 999) { Serial.print(nen, 1); Serial.print(" cm"); }
+  else           Serial.print("trong");
+  Serial.print(" -> chi tinh vat gan hon "); Serial.print(cb.nguong, 1); Serial.println(" cm");
 }
 
 // ---------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("# Buoc 2: thoi diem vat qua tam cam bien"));
 
-  hcsr04_init(&sensor[0], PIN_TRIG_A, PIN_ECHO_A, MAX_CM);
-  hcsr04_init(&sensor[1], PIN_TRIG_B, PIN_ECHO_B, MAX_CM);
-  pd_init(&det[0], 'A', DETECT_CM, END_MISSES);
-  pd_init(&det[1], 'B', DETECT_CM, END_MISSES);
+  camA.ten = 'A';
+  camB.ten = 'B';
+  hcsr04_init(&camA.hc, 2, 3, 110);
+  hcsr04_init(&camB.hc, 4, 5, 110);
 
-  uint8_t addr = findLcdAddress();
-  if (addr) {
-    lcd = new LiquidCrystal_I2C(addr, 16, 2);
-    lcd->init();
-    lcd->backlight();
-    lcd->print("Buoc 2: qua tam");
-    delay(800);
-  } else {
-    Serial.println(F("# KHONG TIM THAY LCD - kiem tra SDA=A4, SCL=A5"));
-  }
+  pinMode(LED_DO, OUTPUT);
+  pinMode(LED_VANG, OUTPUT);
+  pinMode(LED_XANH, OUTPUT);
+  batDen(false, false, false);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.print("DO NEN...");
+  Serial.println("Dang do nen, de trong truoc cam bien...");
+  doNen(camA);
+  doNen(camB);
+
+  lcd.clear();
+  lcd.print("SAN SANG");
+  Serial.println("San sang do");
 }
 
 void loop() {
-  static uint8_t  turn = 0;
-  static uint32_t lastPing = 0, lastLcd = 0;
+  // ---- 1. Đo luân phiên A, B ----
+  static bool luotA = true;
+  static unsigned long lanDoTruoc = 0;
 
-  // ---- 1. Đo luân phiên, đúng nhịp PING_GAP_MS ----
-  uint32_t now = millis();
-  if (now - lastPing >= PING_GAP_MS) {
-    lastPing = now;
-    uint8_t i = turn;
-    turn ^= 1;
+  if (millis() - lanDoTruoc >= NGHI_GIUA_2_LAN) {
+    CamBien &cb = luotA ? camA : camB;
+    luotA = !luotA;
 
-    float cm = hcsr04_read_cm(&sensor[i]);
-    if (cm >= DETECT_CM) cm = HCSR04_NO_ECHO;   // vật xa hơn DETECT_CM -> bỏ qua
-    lastCm[i] = cm;
-    if (pd_update(&det[i], now, cm)) {
-      printPending[i] = true;
-      unpaired[i]     = true;
-      lastPassMs[i]   = det[i].res.tMin;
+    unsigned long t = millis();
+    float d = hcsr04_read_cm(&cb.hc);
+    lanDoTruoc = millis();
+
+    if (d != HCSR04_BUSY) {      // cảm biến còn bận thì bỏ qua lần này
+      capNhat(cb, t, d);
     }
   }
 
-  // ---- 2. Chỉ in / cập nhật LCD khi KHÔNG có vật trước cảm biến nào ----
-  //         (in Serial và ghi LCD tốn thời gian, làm trễ nhịp lấy mẫu)
-  bool busy = det[0].active || det[1].active;
-  if (!busy) {
-    if (printPending[0] || printPending[1]) {
-      // in theo thứ tự thời gian
-      uint8_t first = (printPending[0] && printPending[1] &&
-                       det[1].res.tIn < det[0].res.tIn) ? 1 : 0;
-      for (uint8_t k = 0; k < 2; k++) {
-        uint8_t i = first ^ k;
-        if (printPending[i]) { printPass(&det[i]); printPending[i] = false; }
-      }
-    } else if (millis() - lastLcd > 250) {
-      lastLcd = millis();
-      updateLcd();
-    }
+  // ---- 2. Xử lý kết quả khi không còn vật trước cả 2 cảm biến ----
+  //         (in Serial và ghi LCD chậm, nên chỉ làm lúc này để không ảnh hưởng việc đo)
+  if (camA.dangThayVat || camB.dangThayVat) return;
+
+  if (camA.coKetQua && camB.coKetQua) {
+    tinhKetQua();
+    camA.coKetQua = false;
+    camB.coKetQua = false;
+  }
+  // Chỉ 1 cảm biến có kết quả, chờ 2 giây mà cảm biến kia không thấy gì -> lỗi
+  else if (camA.coKetQua && millis() - camA.tKetThuc > 2000) {
+    Serial.println("Loi: vat chi qua cam bien A");
+    batDen(false, false, false);
+    camA.coKetQua = false;
+  }
+  else if (camB.coKetQua && millis() - camB.tKetThuc > 2000) {
+    Serial.println("Loi: vat chi qua cam bien B");
+    batDen(false, false, false);
+    camB.coKetQua = false;
   }
 }

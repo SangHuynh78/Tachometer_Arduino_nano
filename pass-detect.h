@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define PD_MAX_SAMPLES   64     // số mẫu tối đa lưu lại cho 1 lần đi qua
+#define PD_MAX_SAMPLES   48     // số mẫu tối đa lưu lại (~2 s); giữ nhỏ để đủ RAM khi bật LCD
 #define PD_PRE_SAMPLES   4      // số mẫu "không có vật" giữ lại trước khi vật vào
 #define PD_MIN_HITS      2      // ít hơn số mẫu có vật này -> coi là nhiễu
 #define PD_MAX_EVENT_MS  5000   // vật đứng yên quá lâu -> kết thúc cưỡng bức
